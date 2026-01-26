@@ -4,7 +4,6 @@ import os
 import logging
 import datetime
 from typing import Dict, List, Optional, Tuple
-from pypushdeer import PushDeer
 
 def beijing_time_converter(timestamp):
     utc_dt = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
@@ -261,12 +260,23 @@ def main():
         logger.info(f"未设置 '{ENV_PUSH_KEY}'，跳过推送通知。")
     else:
         try:
-            pushdeer = PushDeer(pushkey=push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info("推送通知发送成功。")
-        except Exception as e:
-            logger.error(f"发送推送通知失败: {e}")
+pushplus_url = "https://www.pushplus.plus/send"
+push_data = {
+    "token": push_key,      # 注意：PushPlus 用 token，不是 pushkey
+    "title": title,
+    "content": content,
+    "template": "txt"       # 因为 content 是纯文本（含 \n），用 txt 模板即可
+}
+try:
+    resp = requests.post(pushplus_url, json=push_data)
+    if resp.status_code == 200 and resp.json().get("code") == 200:
+        logger.info("PushPlus 推送通知发送成功。")
+    else:
+        logger.error(f"PushPlus 推送失败: {resp.text}")
+except Exception as e:
+    logger.error(f"PushPlus 推送异常: {e}")
 
 
 if __name__ == '__main__':
     main()
+
