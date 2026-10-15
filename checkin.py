@@ -5,7 +5,6 @@ import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
-from pypushdeer import PushDeer
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging_config import init_logger
@@ -96,10 +95,13 @@ def log_method(func):
 class Config:
     """应用配置"""
 
-    ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
+    ENV_PUSHPLUS_TOKEN = "PUSHPLUS_TOKEN"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+
+    """兼容旧配置：未设置 PUSHPLUS_TOKEN 时回退读取该变量（其值必须为 PushPlus token）"""
+    ENV_PUSH_TOKEN_LEGACY = "PUSHDEER_SENDKEY"
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -118,7 +120,8 @@ class Config:
     }
 
     def __init__(self):
-        self.push_key: str = ""
+        self.push_token: str = ""
+        self.push_token_source: str = ""
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
@@ -126,16 +129,24 @@ class Config:
 
     def _load_config(self) -> None:
         """加载配置"""
-        push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
+        pushplus_token_env: Optional[str] = os.environ.get(self.ENV_PUSHPLUS_TOKEN)
+        legacy_push_token_env: Optional[str] = os.environ.get(self.ENV_PUSH_TOKEN_LEGACY)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
 
-        if not push_key_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
-            self.push_key = ""
+        # 推送凭据：优先 PUSHPLUS_TOKEN，缺失时回退旧变量名
+        if pushplus_token_env:
+            self.push_token = pushplus_token_env
+            self.push_token_source = self.ENV_PUSHPLUS_TOKEN
+        elif legacy_push_token_env:
+            self.push_token = legacy_push_token_env
+            self.push_token_source = self.ENV_PUSH_TOKEN_LEGACY
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSHPLUS_TOKEN}' 未设置，回退使用 '{self.ENV_PUSH_TOKEN_LEGACY}'。请确认其值为 PushPlus token。")
         else:
-            self.push_key = push_key_env
+            self.push_token = ""
+            self.push_token_source = ""
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSHPLUS_TOKEN}' 未设置，将跳过推送通知。")
 
         if not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
@@ -157,7 +168,10 @@ class Config:
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
-        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
+        if self.push_token:
+            logger.info(f"{LogEmoji.INFO} 当前推送通知已启用（凭据来源: {self.push_token_source}）。")
+        else:
+            logger.info(f"{LogEmoji.INFO} 当前推送通知未启用。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
         if verbose_env is not None:
@@ -451,25 +465,53 @@ class CheckinResult:
 
 
 class PushService:
-    """推送服务"""
+    """推送服务（PushPlus）"""
+
+    """PushPlus 发送接口"""
+    PUSHPLUS_SEND_URL = "https://www.pushplus.plus/send"
+
+    """消息模板：content 为纯文本（含换行）时使用 txt"""
+    DEFAULT_TEMPLATE = "txt"
 
     def __init__(self, config: Config):
         self.config = config
 
-    def send(self, title: str, content: str) -> bool:
-        """发送推送"""
-        if not self.config.push_key:
-            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
+    def send(self, title: str, content: str, template: str = DEFAULT_TEMPLATE) -> bool:
+        """通过 PushPlus 发送推送"""
+        if not self.config.push_token:
+            logger.info(f"{LogEmoji.WARNING} 未设置推送 Token，跳过推送通知。")
+            return False
+
+        payload = {
+            "token": self.config.push_token,
+            "title": title,
+            "content": content,
+            "template": template,
+        }
+
+        try:
+            # 携带超时，避免 Actions 任务因推送接口无响应而挂起
+            response = requests.post(self.PUSHPLUS_SEND_URL, json=payload, timeout=(10, 30))
+        except requests.exceptions.RequestException as e:
+            logger.error(f"{LogEmoji.ERROR} 发送推送通知时发生网络错误: {e}")
+            return False
+
+        if not response.ok:
+            logger.error(f"{LogEmoji.ERROR} 推送请求失败，状态码 {response.status_code}。响应内容: {response.text}")
             return False
 
         try:
-            pushdeer = PushDeer(pushkey=self.config.push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
-            return True
-        except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
+            result = response.json()
+        except ValueError:
+            logger.error(f"{LogEmoji.ERROR} 推送响应解析失败: {response.text}")
             return False
+
+        if result.get("code") == 200:
+            logger.info(f"{LogEmoji.SUCCESS} PushPlus 推送通知发送成功。")
+            return True
+
+        logger.error(f"{LogEmoji.ERROR} PushPlus 推送失败: code={result.get('code')}, msg={result.get('msg', result)}")
+        return False
 
 
 class Checker:
